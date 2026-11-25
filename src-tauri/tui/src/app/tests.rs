@@ -27,6 +27,7 @@ fn effects(directory: &TempDir) -> Effects {
             directory.path().join("session.json"),
             yesplaymusic_core::cache::AudioQuality::High320,
             true,
+            None,
         )),
         store: Arc::new(crate::store::LibraryStore::new(
             directory.path().join("library"),
@@ -537,6 +538,7 @@ async fn a_network_cover_waits_for_debounce_and_schedules_three_neighbors_each_s
             directory.path().join("session.json"),
             AudioQuality::High320,
             true,
+            None,
         )),
         store: Arc::new(crate::store::LibraryStore::new(
             directory.path().join("library"),
@@ -631,6 +633,7 @@ async fn an_l2_hit_is_loaded_before_the_network_debounce() {
             directory.path().join("session.json"),
             AudioQuality::High320,
             true,
+            None,
         )),
         store: Arc::new(crate::store::LibraryStore::new(
             directory.path().join("library"),
@@ -721,6 +724,7 @@ async fn a_prefetched_pixel_warms_the_next_selection() {
             directory.path().join("session.json"),
             AudioQuality::High320,
             true,
+            None,
         )),
         store: Arc::new(crate::store::LibraryStore::new(
             directory.path().join("library"),
@@ -779,6 +783,7 @@ async fn a_selection_without_art_still_prefetches_neighbor_originals() {
             directory.path().join("session.json"),
             AudioQuality::High320,
             true,
+            None,
         )),
         store: Arc::new(crate::store::LibraryStore::new(
             directory.path().join("library"),
@@ -2782,6 +2787,7 @@ async fn a_known_track_uses_the_shared_cache_before_resolving_a_url() {
             directory.path().join("session.json"),
             yesplaymusic_core::cache::AudioQuality::High320,
             true,
+            None,
         )),
         store: Arc::new(crate::store::LibraryStore::new(
             directory.path().join("library"),

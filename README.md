@@ -119,6 +119,7 @@ Nerd Font 图标在设置页把「图标」切到 `nerd`：
 
 ```toml
 quality = "exhigh"       # 128 | 192 | 320/exhigh | lossless | hires
+# unm_api = "http://127.0.0.1:3000" # 自建 api-enhanced 等兼容 /song/url/match 的解灰服务；填写后替代内置 UNM 音源
 cover_mode = "original"  # 终端不支持原图协议时自动回退到 pixel
 pixel_scale = 1.0        # pixel 模式采样细节；不会放大封面占用区域
 cover_size = "auto"      # compact | auto | large，封面占用区域大小

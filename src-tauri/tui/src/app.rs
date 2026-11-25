@@ -2383,6 +2383,7 @@ async fn event_loop(
         config::session_path(),
         config.quality,
         config.unm_enabled,
+        config.unm_api.clone(),
     ));
     let fx = Effects {
         player,
@@ -2664,6 +2665,7 @@ mod playback_health_tests {
                 directory.path().join("session.json"),
                 yesplaymusic_core::cache::AudioQuality::High320,
                 true,
+                None,
             )),
             store: Arc::new(crate::store::LibraryStore::new(
                 directory.path().join("library"),

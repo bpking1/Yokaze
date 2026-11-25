@@ -177,6 +177,12 @@ pub struct Config {
     pub quality: AudioQuality,
     /// Try UNM when NCM explicitly returns no playable URL.
     pub unm_enabled: bool,
+    /// Base URL of a self-hosted UnblockNeteaseMusic-style service that
+    /// answers `GET /song/url/match?id=` — an api-enhanced instance, for
+    /// example. When set it replaces the bundled UNM engines. None keeps
+    /// the bundled engines.
+    #[serde(deserialize_with = "deserialize_optional_string")]
+    pub unm_api: Option<String>,
     /// Built-in theme name or a TOML file in themes/.
     pub theme: String,
     /// Swap paired themes to their light/dark counterpart; Auto follows
@@ -287,6 +293,7 @@ impl Default for Config {
             language: "zh".into(),
             quality: AudioQuality::High320,
             unm_enabled: true,
+            unm_api: None,
             theme: "db16".into(),
             theme_mode: ThemeMode::default(),
             cache_limit_mib: None,
@@ -399,7 +406,26 @@ fn validate_config(config: &Config) -> Result<(), ConfigLoadError> {
             value: config.cache_limit_mib.unwrap_or(0).to_string(),
         });
     }
+    if let Some(base) = &config.unm_api {
+        // A bare `host:port` parses as a URL scheme of its own, and any other
+        // scheme would be requested as if it were HTTP; neither can work.
+        if !is_http_url(base) {
+            return Err(ConfigLoadError::InvalidValue {
+                field: "unm_api",
+                value: base.clone(),
+            });
+        }
+    }
     Ok(())
+}
+
+fn is_http_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some_and(|host| !host.is_empty())
+            && url.query().is_none()
+            && url.fragment().is_none()
+    })
 }
 
 const TEMPLATE: &str = r#"# ypm 配置 — 常用项也可在 ypm 设置页修改；手动编辑后重启生效。
@@ -408,6 +434,7 @@ const TEMPLATE: &str = r#"# ypm 配置 — 常用项也可在 ypm 设置页修�
 # language = "zh"            # zh | en | ja
 # quality = "exhigh"          # 128 | 192 | 320/exhigh | lossless | hires
 # unm_enabled = true          # 无版权/VIP 曲目无可播地址时尝试 UNM 换源
+# unm_api = "http://127.0.0.1:3000" # 自建 api-enhanced 等兼容 /song/url/match 的解灰服务地址；填写后替代内置 UNM 音源
 # theme = "db16"              # db16 | pico8 | gameboy | everforest | everforest-light | tokyo-night | tokyo-night-storm
 #                              # tokyo-night-day | one-dark | one-dark-pro | one-light | dracula | alucard
 #                              # synthwave84 | laserwave | fairyfloss | ultraviolence | transparent
@@ -441,6 +468,16 @@ const TEMPLATE: &str = r#"# ypm 配置 — 常用项也可在 ypm 设置页修�
 #                              # pulse | classic | scan | ripple | dissolve | breath |
 #                              # vinyl | rain | zoom | off；旧配置的 true/false 仍兼容
 "#;
+
+fn deserialize_optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = Option::<String>::deserialize(deserializer)?;
+    Ok(value
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty()))
+}
 
 fn deserialize_language<'de, D>(deserializer: D) -> Result<String, D::Error>
 where
@@ -765,6 +802,51 @@ mod tests {
     }
 
     #[test]
+    fn unm_api_is_optional_and_must_be_an_http_url() {
+        assert_eq!(Config::default().unm_api, None);
+        assert_eq!(
+            parse_with_metadata("unm_api = \"\"")
+                .unwrap()
+                .config
+                .unm_api,
+            None
+        );
+        assert_eq!(
+            parse_with_metadata("unm_api = \"   \"")
+                .unwrap()
+                .config
+                .unm_api,
+            None
+        );
+
+        let parsed = parse_with_metadata("unm_api = \"http://127.0.0.1:3007\"").unwrap();
+        assert_eq!(
+            parsed.config.unm_api.as_deref(),
+            Some("http://127.0.0.1:3007")
+        );
+
+        for value in [
+            "127.0.0.1:3007",
+            "ftp://host",
+            "http://",
+            "http://127.0.0.1:3007?x=1",
+            "http://127.0.0.1:3007#frag",
+        ] {
+            let text = format!("unm_api = {value:?}");
+            assert!(
+                matches!(
+                    parse_with_metadata(&text),
+                    Err(ConfigLoadError::InvalidValue {
+                        field: "unm_api",
+                        ..
+                    })
+                ),
+                "should fail: {text}"
+            );
+        }
+    }
+
+    #[test]
     fn missing_config_creates_a_template_but_other_read_errors_surface() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("nested/config.toml");
@@ -848,6 +930,7 @@ mod tests {
                 language: "ja".into(),
                 quality,
                 unm_enabled: false,
+                unm_api: Some("http://127.0.0.1:3007".into()),
                 theme: "tokyo-night".into(),
                 theme_mode: ThemeMode::Light,
                 cache_limit_mib: Some(2048),

@@ -100,6 +100,8 @@ fn song_row_from_hit(hit: SongItem) -> SongRow {
 use crate::i18n::{self, Key};
 
 const UNM_RESOLVE_TIMEOUT: Duration = Duration::from_secs(30);
+/// `UnmResolution::provider` for tracks resolved through `unm_api`.
+const REMOTE_UNM_PROVIDER: &str = "api-enhanced";
 /// Every outbound HTTP call this crate owns is bounded: a dead CDN or a
 /// captive portal must not hang a cover fetch forever.
 const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -192,6 +194,77 @@ impl UnmResolver for UnmState {
     }
 }
 
+/// Resolves grey tracks through the service configured as `unm_api` — an
+/// api-enhanced instance answering `GET /song/url/match?id=`. It carries no
+/// provider code of its own: the sources, their order and their upkeep stay
+/// with the service, so a source going stale is fixed by updating the
+/// service rather than by rebuilding ypm.
+struct RemoteUnm {
+    client: reqwest::Client,
+    endpoint: String,
+}
+
+impl RemoteUnm {
+    fn new(base: &str) -> Self {
+        Self {
+            client: http_client().clone(),
+            endpoint: format!("{}/song/url/match", base.trim_end_matches('/')),
+        }
+    }
+}
+
+fn is_http_url(value: &str) -> bool {
+    reqwest::Url::parse(value).is_ok_and(|url| {
+        matches!(url.scheme(), "http" | "https")
+            && url.host_str().is_some_and(|host| !host.is_empty())
+    })
+}
+
+impl UnmResolver for RemoteUnm {
+    fn resolve<'a>(&'a self, payload: &'a Value) -> BoxFuture<'a, Result<Option<UnmResolution>>> {
+        Box::pin(async move {
+            let id = payload
+                .pointer("/track/id")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("remote UNM needs a numeric track id"))?;
+            let response = self
+                .client
+                .get(&self.endpoint)
+                .query(&[("id", id)])
+                .send()
+                .await?;
+            let status = response.status();
+            // api-enhanced answers 500 when no source has the track; treat that
+            // as a miss. Other non-2xx statuses (404, 502, ...) surface as errors
+            // so `resolve_unm_track` logs them under `--debug`.
+            if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR {
+                return Ok(None);
+            }
+            if !status.is_success() {
+                return Err(anyhow!("remote UNM returned HTTP {status}"));
+            }
+            let body = response.text().await?;
+            let body: Value = serde_json::from_str(&body)?;
+            if body
+                .get("code")
+                .and_then(Value::as_i64)
+                .is_some_and(|code| code != 200)
+            {
+                return Ok(None);
+            }
+            Ok(body
+                .get("data")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|url| is_http_url(url))
+                .map(|url| UnmResolution {
+                    provider: REMOTE_UNM_PROVIDER.into(),
+                    url: url.to_owned(),
+                }))
+        })
+    }
+}
+
 /// Which library list is on screen / feeding the queue.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -260,14 +333,17 @@ pub struct Ncm {
 }
 
 impl Ncm {
-    pub fn new(session_path: PathBuf, quality: AudioQuality, unm_enabled: bool) -> Self {
-        Self::with_unm(
-            session_path,
-            quality,
-            unm_enabled,
-            Arc::new(UnmState::new()),
-            UNM_RESOLVE_TIMEOUT,
-        )
+    pub fn new(
+        session_path: PathBuf,
+        quality: AudioQuality,
+        unm_enabled: bool,
+        unm_api: Option<String>,
+    ) -> Self {
+        let unm: Arc<dyn UnmResolver> = match unm_api {
+            Some(base) => Arc::new(RemoteUnm::new(&base)),
+            None => Arc::new(UnmState::new()),
+        };
+        Self::with_unm(session_path, quality, unm_enabled, unm, UNM_RESOLVE_TIMEOUT)
     }
 
     fn with_unm(
@@ -780,7 +856,7 @@ mod tests {
 
     fn ncm(quality: AudioQuality) -> Ncm {
         let dir = tempfile::tempdir().unwrap();
-        Ncm::new(dir.path().join("session.json"), quality, true)
+        Ncm::new(dir.path().join("session.json"), quality, true, None)
     }
 
     #[derive(Clone)]
@@ -1106,6 +1182,118 @@ mod tests {
         assert_eq!(HTTP_REQUEST_TIMEOUT, Duration::from_secs(30));
         // Same instance every call: the pool has to survive across covers.
         assert!(std::ptr::eq(http_client(), http_client()));
+    }
+
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// Answers the first request with `response` and resolves to its
+    /// request line, so a test can see what the client asked for.
+    async fn serve_http_once(
+        response: String,
+    ) -> (std::net::SocketAddr, tokio::task::JoinHandle<String>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let request = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut chunk = [0u8; 512];
+            while !head.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).await.unwrap();
+                if read == 0 {
+                    break;
+                }
+                head.extend_from_slice(&chunk[..read]);
+            }
+            let head = String::from_utf8_lossy(&head).into_owned();
+            stream.write_all(response.as_bytes()).await.unwrap();
+            head.split("\r\n").next().unwrap_or_default().to_owned()
+        });
+        (address, request)
+    }
+
+    #[tokio::test]
+    async fn remote_unm_asks_the_match_endpoint_for_the_track_id() {
+        let (address, request) = serve_http_once(http_response(
+            "200 OK",
+            r#"{"code":200,"data":"http://audio.example/a.mp3?from=bodian"}"#,
+        ))
+        .await;
+        // A trailing slash on the configured base must not double up.
+        let resolver = RemoteUnm::new(&format!("http://{address}/"));
+
+        let resolution = resolver
+            .resolve(&json!({"track": {"id": 186016}, "context": {}}))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            resolution,
+            Some(UnmResolution {
+                provider: REMOTE_UNM_PROVIDER.into(),
+                url: "http://audio.example/a.mp3?from=bodian".into(),
+            })
+        );
+        assert_eq!(
+            request.await.unwrap(),
+            "GET /song/url/match?id=186016 HTTP/1.1"
+        );
+    }
+
+    #[tokio::test]
+    async fn remote_unm_treats_every_miss_as_none() {
+        for response in [
+            http_response(
+                "500 Internal Server Error",
+                r#"{"code":500,"msg":"No available source found","data":[]}"#,
+            ),
+            http_response("200 OK", r#"{"code":200,"data":null}"#),
+            http_response("200 OK", r#"{"code":200,"data":"  "}"#),
+            http_response("200 OK", r#"{"code":200}"#),
+            http_response(
+                "200 OK",
+                r#"{"code":500,"data":"http://audio.example/a.mp3"}"#,
+            ),
+            http_response("200 OK", r#"{"code":200,"data":"not a url"}"#),
+        ] {
+            let (address, request) = serve_http_once(response).await;
+            let resolver = RemoteUnm::new(&format!("http://{address}"));
+
+            let resolution = resolver.resolve(&json!({"track": {"id": 1}})).await;
+
+            assert_eq!(resolution.unwrap(), None);
+            request.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn remote_unm_reports_unexpected_http_statuses_as_errors() {
+        let (address, request) = serve_http_once(http_response("404 Not Found", "")).await;
+        let resolver = RemoteUnm::new(&format!("http://{address}"));
+
+        let error = resolver
+            .resolve(&json!({"track": {"id": 1}}))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("404"));
+        request.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remote_unm_refuses_payloads_without_a_track_id() {
+        let resolver = RemoteUnm::new("http://127.0.0.1:9");
+
+        let error = resolver
+            .resolve(&json!({"track": {"name": "no id here"}}))
+            .await
+            .unwrap_err();
+
+        assert!(error.to_string().contains("track id"));
     }
 
     #[tokio::test]

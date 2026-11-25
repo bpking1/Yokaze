@@ -18,6 +18,7 @@ fn effects(directory: &TempDir) -> Effects {
             directory.path().join("session.json"),
             yesplaymusic_core::cache::AudioQuality::High320,
             true,
+            None,
         )),
         store: Arc::new(crate::store::LibraryStore::new(
             directory.path().join("library"),
