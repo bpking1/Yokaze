@@ -705,7 +705,6 @@ fn actor(context: ActorContext) {
         if disconnected {
             drop(pending.take());
             stop(&engine, &mut active_cancel);
-            engine = None;
             break;
         }
 
