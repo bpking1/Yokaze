@@ -9,10 +9,11 @@
 mod cache_stream;
 
 use std::io::{Cursor, Read, Seek};
-use std::sync::{mpsc as std_mpsc, Arc};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc as std_mpsc, Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use rodio::{Decoder, Player};
+use rodio::{ChannelCount, Decoder, Player, SampleRate, Source};
 use stream_download::{Settings, StreamDownload, StreamHandle, StreamPhase};
 use tokio::sync::{mpsc, oneshot};
 use yesplaymusic_core::cache::{CacheLease, CacheMetadata};
@@ -95,21 +96,28 @@ impl PlayerHandle {
 pub fn spawn(
     runtime: tokio::runtime::Handle,
 ) -> (PlayerHandle, mpsc::UnboundedReceiver<PlayerEvent>) {
-    spawn_with_engine(runtime, open_engine)
+    spawn_with_backend(
+        runtime,
+        Box::new(SystemOutputBackend),
+        DEVICE_POLL_INTERVAL,
+        SWITCH_RETRY_DELAY,
+    )
 }
 
-type EngineFactory = fn(f32) -> anyhow::Result<Engine>;
-
-fn spawn_with_engine(
+fn spawn_with_backend(
     runtime: tokio::runtime::Handle,
-    engine_factory: EngineFactory,
+    backend: Box<dyn OutputBackend>,
+    device_poll_interval: Duration,
+    retry_delay: Duration,
 ) -> (PlayerHandle, mpsc::UnboundedReceiver<PlayerEvent>) {
     let samples = SampleBuffer::shared();
     let (command_tx, command_rx) = std_mpsc::channel();
     let (wake_tx, wake_rx) = std_mpsc::channel();
     let (work_tx, work_rx) = std_mpsc::channel();
+    let (sink_error_tx, sink_error_rx) = std_mpsc::channel();
     let (event_tx, event_rx) = mpsc::unbounded_channel();
     let actor_wake = wake_tx.clone();
+    let output_wake = wake_tx.clone();
     let actor_samples = samples.clone();
     std::thread::Builder::new()
         .name("ypm-player".into())
@@ -121,8 +129,15 @@ fn spawn_with_engine(
                 wake_tx: actor_wake,
                 work_tx,
                 work_rx,
+                sink_errors: sink_error_rx,
                 events: event_tx,
-                engine_factory,
+                output: OutputContext {
+                    backend,
+                    errors: sink_error_tx,
+                    wake: output_wake,
+                    retry_delay,
+                },
+                device_poll_interval,
                 samples: actor_samples,
             })
         })
@@ -218,20 +233,282 @@ impl Drop for PendingWork {
 
 // Word-synchronised lyrics need a responsive clock without busy-redrawing.
 const TICK: Duration = Duration::from_millis(50);
+/// Poll interval for detecting OS default output device switches (e.g.
+/// Windows taskbar audio switcher) without noticeable latency or overhead.
+const DEVICE_POLL_INTERVAL: Duration = Duration::from_millis(500);
+/// One brief retry when opening the replacement sink right after an OS
+/// device switch (WASAPI endpoints can momentarily report busy).
+const SWITCH_RETRY_DELAY: Duration = Duration::from_millis(150);
 
-struct Engine {
-    _output: EngineOutput,
-    player: Player,
+struct SharedOutput {
+    queue: Mutex<rodio::queue::SourcesQueueOutput>,
+    active_token: AtomicU64,
 }
 
-enum EngineOutput {
+/// Bridges the single long-lived `rodio::Player` queue into whichever OS
+/// `MixerDeviceSink` is currently attached. Flipping `active_token` cleanly
+/// detaches an old sink so playback can pause on disconnect or hot-switch
+/// devices without re-downloading or re-decoding the active track.
+struct OutputBridge {
+    shared: Arc<SharedOutput>,
+    token: u64,
+}
+
+impl Iterator for OutputBridge {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.shared.active_token.load(Ordering::Acquire) != self.token {
+            return None;
+        }
+        let mut queue = self
+            .shared
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if self.shared.active_token.load(Ordering::Acquire) != self.token {
+            return None;
+        }
+        queue.next()
+    }
+}
+
+impl Source for OutputBridge {
+    fn current_span_len(&self) -> Option<usize> {
+        if self.shared.active_token.load(Ordering::Acquire) != self.token {
+            return Some(0);
+        }
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .current_span_len()
+    }
+
+    fn channels(&self) -> ChannelCount {
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .channels()
+    }
+
+    fn sample_rate(&self) -> SampleRate {
+        self.shared
+            .queue
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeviceChange {
+    Unchanged,
+    Switched,
+    Disconnected,
+}
+
+enum SinkHandle {
     Device {
         _sink: rodio::MixerDeviceSink,
+        device_id: Option<rodio::cpal::DeviceId>,
     },
     #[cfg(test)]
-    Silent {
-        _source: rodio::queue::SourcesQueueOutput,
+    Silent { _bridge: OutputBridge },
+    #[cfg(test)]
+    Fake {
+        device_id: u64,
+        _bridge: OutputBridge,
     },
+}
+
+struct ActiveSink {
+    token: u64,
+    handle: SinkHandle,
+}
+
+trait OutputBackend: Send + 'static {
+    fn open(
+        &mut self,
+        bridge: OutputBridge,
+        token: u64,
+        errors: std_mpsc::Sender<u64>,
+        wake: std_mpsc::Sender<()>,
+    ) -> anyhow::Result<SinkHandle>;
+
+    fn poll_device_change(&mut self, sink: &SinkHandle) -> DeviceChange;
+}
+
+struct SystemOutputBackend;
+
+impl OutputBackend for SystemOutputBackend {
+    fn open(
+        &mut self,
+        bridge: OutputBridge,
+        token: u64,
+        errors: std_mpsc::Sender<u64>,
+        wake: std_mpsc::Sender<()>,
+    ) -> anyhow::Result<SinkHandle> {
+        use rodio::cpal::traits::{DeviceTrait, HostTrait};
+
+        let host = rodio::cpal::default_host();
+        let device = host
+            .default_output_device()
+            .ok_or_else(|| anyhow::anyhow!("no default audio output device"))?;
+        let device_id = device.id().ok();
+        let builder = rodio::DeviceSinkBuilder::from_device(device)
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            .with_error_callback(move |error| {
+                tracing::warn!(?error, token, "audio output stream error");
+                let _ = errors.send(token);
+                let _ = wake.send(());
+            });
+        let mut sink = builder
+            .open_sink_or_fallback()
+            .map_err(|error| anyhow::anyhow!("{error}"))?;
+        // Avoid stderr drop chatter corrupting the TUI when replacing sinks.
+        sink.log_on_drop(false);
+        sink.mixer().add(bridge);
+        Ok(SinkHandle::Device {
+            _sink: sink,
+            device_id,
+        })
+    }
+
+    fn poll_device_change(&mut self, sink: &SinkHandle) -> DeviceChange {
+        use rodio::cpal::traits::{DeviceTrait, HostTrait};
+
+        let SinkHandle::Device {
+            device_id: Some(current_id),
+            ..
+        } = sink
+        else {
+            return DeviceChange::Unchanged;
+        };
+        let host = rodio::cpal::default_host();
+        let Some(default_device) = host.default_output_device() else {
+            return DeviceChange::Disconnected;
+        };
+        let Ok(default_id) = default_device.id() else {
+            return DeviceChange::Unchanged;
+        };
+        if &default_id == current_id {
+            return DeviceChange::Unchanged;
+        }
+        // Distinguish manual OS output switching (previous device still active)
+        // from physical/Bluetooth disconnect (previous device gone): only
+        // hot-switch when the previous device is still present; a vanished
+        // device auto-pauses instead of blasting laptop speakers.
+        let still_present = host.output_devices().ok().is_some_and(|mut devices| {
+            devices.any(|device| device.id().is_ok_and(|id| &id == current_id))
+        });
+        if still_present {
+            DeviceChange::Switched
+        } else {
+            DeviceChange::Disconnected
+        }
+    }
+}
+
+struct OutputContext {
+    backend: Box<dyn OutputBackend>,
+    errors: std_mpsc::Sender<u64>,
+    wake: std_mpsc::Sender<()>,
+    retry_delay: Duration,
+}
+
+struct Engine {
+    player: Player,
+    shared: Arc<SharedOutput>,
+    active_sink: Option<ActiveSink>,
+    next_token: u64,
+}
+
+impl Drop for Engine {
+    fn drop(&mut self) {
+        self.drop_sink();
+    }
+}
+
+impl Engine {
+    fn open(volume: f32, output: &mut OutputContext) -> anyhow::Result<Self> {
+        let (player, queue_output) = Player::new();
+        player.set_volume(volume);
+        let shared = Arc::new(SharedOutput {
+            queue: Mutex::new(queue_output),
+            active_token: AtomicU64::new(0),
+        });
+        let mut engine = Self {
+            player,
+            shared,
+            active_sink: None,
+            next_token: 1,
+        };
+        engine.reopen_sink(output)?;
+        Ok(engine)
+    }
+
+    fn drop_sink(&mut self) {
+        self.shared.active_token.store(0, Ordering::Release);
+        self.active_sink = None;
+    }
+
+    fn reopen_sink(&mut self, output: &mut OutputContext) -> anyhow::Result<()> {
+        self.drop_sink();
+        let token = self.next_token;
+        self.next_token += 1;
+        self.shared.active_token.store(token, Ordering::Release);
+        let bridge = OutputBridge {
+            shared: self.shared.clone(),
+            token,
+        };
+        match output
+            .backend
+            .open(bridge, token, output.errors.clone(), output.wake.clone())
+        {
+            Ok(handle) => {
+                self.active_sink = Some(ActiveSink { token, handle });
+                Ok(())
+            }
+            Err(error) => {
+                self.shared.active_token.store(0, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    fn hot_switch_sink(&mut self, output: &mut OutputContext) -> anyhow::Result<()> {
+        match self.reopen_sink(output) {
+            Ok(()) => Ok(()),
+            Err(first_error) => {
+                if !output.retry_delay.is_zero() {
+                    std::thread::sleep(output.retry_delay);
+                    if self.reopen_sink(output).is_ok() {
+                        return Ok(());
+                    }
+                }
+                Err(first_error)
+            }
+        }
+    }
+
+    fn ensure_output_ready(&mut self, output: &mut OutputContext) -> anyhow::Result<()> {
+        let needs_reopen = match &self.active_sink {
+            None => true,
+            Some(active) => {
+                output.backend.poll_device_change(&active.handle) != DeviceChange::Unchanged
+            }
+        };
+        if needs_reopen {
+            self.hot_switch_sink(output)?;
+        }
+        Ok(())
+    }
 }
 
 struct ActorContext {
@@ -241,8 +518,10 @@ struct ActorContext {
     wake_tx: std_mpsc::Sender<()>,
     work_tx: std_mpsc::Sender<CompletedWork>,
     work_rx: std_mpsc::Receiver<CompletedWork>,
+    sink_errors: std_mpsc::Receiver<u64>,
     events: mpsc::UnboundedSender<PlayerEvent>,
-    engine_factory: EngineFactory,
+    output: OutputContext,
+    device_poll_interval: Duration,
     samples: Arc<SampleBuffer>,
 }
 
@@ -254,8 +533,10 @@ fn actor(context: ActorContext) {
         wake_tx,
         work_tx,
         work_rx,
+        sink_errors,
         events,
-        engine_factory,
+        mut output,
+        device_poll_interval,
         samples,
     } = context;
     let mut engine: Option<Engine> = None;
@@ -265,10 +546,23 @@ fn actor(context: ActorContext) {
     let mut active_cancel: Option<StreamCancel> = None;
     let mut next_request = 1_u64;
     let mut last_tick = Instant::now();
+    let mut last_device_poll = Instant::now();
 
     loop {
-        let wait = TICK.saturating_sub(last_tick.elapsed());
+        let wait = TICK
+            .saturating_sub(last_tick.elapsed())
+            .min(device_poll_interval.saturating_sub(last_device_poll.elapsed()));
         let _ = wake.recv_timeout(wait);
+
+        while let Ok(error_token) = sink_errors.try_recv() {
+            let matches_active = engine
+                .as_ref()
+                .and_then(|engine| engine.active_sink.as_ref())
+                .is_some_and(|active| active.token == error_token);
+            if matches_active {
+                handle_device_disconnect(engine.as_mut(), active_generation, &events);
+            }
+        }
 
         let mut disconnected = false;
         loop {
@@ -345,19 +639,42 @@ fn actor(context: ActorContext) {
                     ));
                 }
                 PlayerCommand::Play => {
-                    if let (Some(engine), Some(_)) = (&engine, active_generation) {
-                        engine.player.play();
-                    }
-                }
-                PlayerCommand::TogglePause => {
-                    if let (Some(engine), Some(generation)) = (&engine, active_generation) {
-                        let paused = !engine.player.is_paused();
-                        if paused {
-                            engine.player.pause();
+                    if let (Some(engine), Some(generation)) = (engine.as_mut(), active_generation) {
+                        if let Err(error) = engine.ensure_output_ready(&mut output) {
+                            cancel_active(&mut active_cancel);
+                            engine.player.stop();
+                            active_generation = None;
+                            let _ = events.send(PlayerEvent::Failed {
+                                generation,
+                                message: format!("audio device unavailable: {error}"),
+                                cached: None,
+                                unm_source: false,
+                            });
                         } else {
                             engine.player.play();
                         }
-                        let _ = events.send(PlayerEvent::Paused { generation, paused });
+                    }
+                }
+                PlayerCommand::TogglePause => {
+                    if let (Some(engine), Some(generation)) = (engine.as_mut(), active_generation) {
+                        let paused = !engine.player.is_paused();
+                        if paused {
+                            engine.player.pause();
+                            let _ = events.send(PlayerEvent::Paused { generation, paused });
+                        } else if let Err(error) = engine.ensure_output_ready(&mut output) {
+                            cancel_active(&mut active_cancel);
+                            engine.player.stop();
+                            active_generation = None;
+                            let _ = events.send(PlayerEvent::Failed {
+                                generation,
+                                message: format!("audio device unavailable: {error}"),
+                                cached: None,
+                                unm_source: false,
+                            });
+                        } else {
+                            engine.player.play();
+                            let _ = events.send(PlayerEvent::Paused { generation, paused });
+                        }
                     }
                 }
                 PlayerCommand::SeekTo(position) => {
@@ -388,6 +705,7 @@ fn actor(context: ActorContext) {
         if disconnected {
             drop(pending.take());
             stop(&engine, &mut active_cancel);
+            engine = None;
             break;
         }
 
@@ -417,11 +735,11 @@ fn actor(context: ActorContext) {
                 WorkResult::Decoded(Ok(decoded)) => {
                     if let Some(started) = start_decoded(
                         &mut engine,
+                        &mut output,
                         volume,
                         completed.generation,
                         &events,
                         decoded,
-                        engine_factory,
                         samples.clone(),
                     ) {
                         active_generation = Some(completed.generation);
@@ -430,6 +748,32 @@ fn actor(context: ActorContext) {
                 }
                 WorkResult::Decoded(Err(error)) => {
                     report_failure(&events, completed.generation, error);
+                }
+            }
+        }
+
+        if last_device_poll.elapsed() >= device_poll_interval {
+            last_device_poll = Instant::now();
+            if let Some(engine) = engine.as_mut() {
+                let change = engine
+                    .active_sink
+                    .as_ref()
+                    .map_or(DeviceChange::Unchanged, |active| {
+                        output.backend.poll_device_change(&active.handle)
+                    });
+                match change {
+                    DeviceChange::Unchanged => {}
+                    DeviceChange::Disconnected => {
+                        tracing::info!("audio output device disconnected; pausing playback");
+                        handle_device_disconnect(Some(engine), active_generation, &events);
+                    }
+                    DeviceChange::Switched => {
+                        tracing::info!("default audio output changed; switching sink");
+                        if let Err(error) = engine.hot_switch_sink(&mut output) {
+                            tracing::warn!(%error, "failed to switch audio output device");
+                            handle_device_disconnect(Some(engine), active_generation, &events);
+                        }
+                    }
                 }
             }
         }
@@ -452,10 +796,34 @@ fn actor(context: ActorContext) {
     }
 }
 
-fn stop(engine: &Option<Engine>, active_cancel: &mut Option<StreamCancel>) {
+fn handle_device_disconnect(
+    engine: Option<&mut Engine>,
+    active_generation: Option<u64>,
+    events: &mpsc::UnboundedSender<PlayerEvent>,
+) {
+    let Some(engine) = engine else {
+        return;
+    };
+    engine.drop_sink();
+    if let Some(generation) = active_generation {
+        if !engine.player.empty() && !engine.player.is_paused() {
+            engine.player.pause();
+            let _ = events.send(PlayerEvent::Paused {
+                generation,
+                paused: true,
+            });
+        }
+    }
+}
+
+fn cancel_active(active_cancel: &mut Option<StreamCancel>) {
     if let Some(cancel) = active_cancel.take() {
         cancel();
     }
+}
+
+fn stop(engine: &Option<Engine>, active_cancel: &mut Option<StreamCancel>) {
+    cancel_active(active_cancel);
     if let Some(engine) = engine {
         engine.player.stop();
     }
@@ -629,16 +997,27 @@ fn decode(media: Media) -> Result<Decoded, DecodeFailure> {
 
 fn start_decoded(
     engine: &mut Option<Engine>,
+    output: &mut OutputContext,
     volume: f32,
     generation: u64,
     events: &mpsc::UnboundedSender<PlayerEvent>,
     decoded: Decoded,
-    engine_factory: EngineFactory,
     samples: Arc<SampleBuffer>,
 ) -> Option<StartedPlayback> {
     let engine = match engine {
-        Some(engine) => engine,
-        None => match engine_factory(volume) {
+        Some(engine) => {
+            if let Err(error) = engine.ensure_output_ready(output) {
+                let _ = events.send(PlayerEvent::Failed {
+                    generation,
+                    message: format!("audio device unavailable: {error}"),
+                    cached: None,
+                    unm_source: false,
+                });
+                return None;
+            }
+            engine
+        }
+        None => match Engine::open(volume, output) {
             Ok(opened) => engine.insert(opened),
             Err(error) => {
                 let _ = events.send(PlayerEvent::Failed {
@@ -680,6 +1059,38 @@ fn report_failure(
 }
 
 #[cfg(test)]
+struct SilentOutputBackend;
+
+#[cfg(test)]
+impl OutputBackend for SilentOutputBackend {
+    fn open(
+        &mut self,
+        bridge: OutputBridge,
+        _token: u64,
+        _errors: std_mpsc::Sender<u64>,
+        _wake: std_mpsc::Sender<()>,
+    ) -> anyhow::Result<SinkHandle> {
+        Ok(SinkHandle::Silent { _bridge: bridge })
+    }
+
+    fn poll_device_change(&mut self, _sink: &SinkHandle) -> DeviceChange {
+        DeviceChange::Unchanged
+    }
+}
+
+#[cfg(test)]
+fn spawn_silent(
+    runtime: tokio::runtime::Handle,
+) -> (PlayerHandle, mpsc::UnboundedReceiver<PlayerEvent>) {
+    spawn_with_backend(
+        runtime,
+        Box::new(SilentOutputBackend),
+        DEVICE_POLL_INTERVAL,
+        Duration::ZERO,
+    )
+}
+
+#[cfg(test)]
 fn start<F>(
     engine: &mut Option<Engine>,
     volume: f32,
@@ -712,37 +1123,24 @@ where
             return false;
         }
     };
+    let (error_tx, _error_rx) = std_mpsc::channel();
+    let (wake_tx, _wake_rx) = std_mpsc::channel();
+    let mut output = OutputContext {
+        backend: Box::new(SilentOutputBackend),
+        errors: error_tx,
+        wake: wake_tx,
+        retry_delay: Duration::ZERO,
+    };
     start_decoded(
         engine,
+        &mut output,
         volume,
         generation,
         events,
         decoded,
-        open_engine,
         SampleBuffer::shared(),
     )
     .is_some()
-}
-
-fn open_engine(volume: f32) -> anyhow::Result<Engine> {
-    let device = rodio::DeviceSinkBuilder::open_default_sink()
-        .map_err(|error| anyhow::anyhow!("{error}"))?;
-    let player = Player::connect_new(device.mixer());
-    player.set_volume(volume);
-    Ok(Engine {
-        _output: EngineOutput::Device { _sink: device },
-        player,
-    })
-}
-
-#[cfg(test)]
-fn open_silent_engine(volume: f32) -> anyhow::Result<Engine> {
-    let (player, source) = Player::new();
-    player.set_volume(volume);
-    Ok(Engine {
-        _output: EngineOutput::Silent { _source: source },
-        player,
-    })
 }
 
 #[cfg(test)]
@@ -750,7 +1148,7 @@ mod tests {
     use std::io::{Read, Write};
     use std::net::TcpListener;
     use std::path::Path;
-    use std::sync::mpsc as std_mpsc;
+    use std::sync::{mpsc as std_mpsc, Arc, Mutex};
     use std::thread;
     use std::time::Duration;
 
@@ -760,8 +1158,8 @@ mod tests {
     };
 
     use super::{
-        open_cached, open_silent_engine, open_url, spawn, spawn_with_engine, start, CacheWritePlan,
-        PlayerCommand, PlayerEvent,
+        open_cached, open_url, spawn, spawn_silent, spawn_with_backend, start, CacheWritePlan,
+        DeviceChange, OutputBackend, OutputBridge, PlayerCommand, PlayerEvent, SinkHandle,
     };
 
     const AUDIO_BODY: &[u8] = b"complete cache body";
@@ -988,8 +1386,7 @@ mod tests {
     async fn a_new_play_replaces_a_stalled_decoder_without_starting_it() {
         let mut stalled = StalledServer::spawn();
         let replacement = HttpServer::complete(WAV_BODY);
-        let (player, mut events) =
-            spawn_with_engine(tokio::runtime::Handle::current(), open_silent_engine);
+        let (player, mut events) = spawn_silent(tokio::runtime::Handle::current());
         player.send(PlayerCommand::PlayUrl {
             generation: 1,
             url: stalled.url.clone(),
@@ -1039,8 +1436,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn decoded_track_waits_for_explicit_play_before_reporting_position() {
         let server = HttpServer::complete(WAV_BODY);
-        let (player, mut events) =
-            spawn_with_engine(tokio::runtime::Handle::current(), open_silent_engine);
+        let (player, mut events) = spawn_silent(tokio::runtime::Handle::current());
         player.send(PlayerCommand::PlayUrl {
             generation: 7,
             url: server.url.clone(),
@@ -1079,8 +1475,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn in_memory_audio_uses_the_same_generation_stamped_decode_path() {
-        let (player, mut events) =
-            spawn_with_engine(tokio::runtime::Handle::current(), open_silent_engine);
+        let (player, mut events) = spawn_silent(tokio::runtime::Handle::current());
 
         player.send(PlayerCommand::PlayBytes {
             generation: 11,
@@ -1097,8 +1492,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unm_url_open_failure_keeps_its_origin() {
-        let (player, mut events) =
-            spawn_with_engine(tokio::runtime::Handle::current(), open_silent_engine);
+        let (player, mut events) = spawn_silent(tokio::runtime::Handle::current());
 
         player.send(PlayerCommand::PlayUrl {
             generation: 12,
@@ -1124,8 +1518,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn unm_bytes_decode_failure_keeps_its_origin() {
-        let (player, mut events) =
-            spawn_with_engine(tokio::runtime::Handle::current(), open_silent_engine);
+        let (player, mut events) = spawn_silent(tokio::runtime::Handle::current());
 
         player.send(PlayerCommand::PlayBytes {
             generation: 13,
@@ -1276,5 +1669,261 @@ mod tests {
                 ..
             } if failed == metadata
         ));
+    }
+
+    struct FakeOutputState {
+        default_device: u64,
+        present_devices: Vec<u64>,
+        opened_devices: Vec<u64>,
+        error_channel: Option<(u64, std_mpsc::Sender<u64>, std_mpsc::Sender<()>)>,
+    }
+
+    struct FakeOutputBackend {
+        state: Arc<Mutex<FakeOutputState>>,
+    }
+
+    impl OutputBackend for FakeOutputBackend {
+        fn open(
+            &mut self,
+            bridge: OutputBridge,
+            token: u64,
+            errors: std_mpsc::Sender<u64>,
+            wake: std_mpsc::Sender<()>,
+        ) -> anyhow::Result<SinkHandle> {
+            let mut state = self.state.lock().unwrap();
+            let device_id = state.default_device;
+            state.opened_devices.push(device_id);
+            state.error_channel = Some((token, errors, wake));
+            Ok(SinkHandle::Fake {
+                device_id,
+                _bridge: bridge,
+            })
+        }
+
+        fn poll_device_change(&mut self, sink: &SinkHandle) -> DeviceChange {
+            let SinkHandle::Fake { device_id, .. } = sink else {
+                return DeviceChange::Unchanged;
+            };
+            let state = self.state.lock().unwrap();
+            if state.default_device == *device_id {
+                DeviceChange::Unchanged
+            } else if state.present_devices.contains(device_id) {
+                DeviceChange::Switched
+            } else {
+                DeviceChange::Disconnected
+            }
+        }
+    }
+
+    async fn recv_until<F>(
+        events: &mut mpsc::UnboundedReceiver<PlayerEvent>,
+        limit: Duration,
+        mut predicate: F,
+    ) -> PlayerEvent
+    where
+        F: FnMut(&PlayerEvent) -> bool,
+    {
+        tokio::time::timeout(limit, async {
+            loop {
+                let event = events.recv().await.expect("player event channel open");
+                if predicate(&event) {
+                    return event;
+                }
+            }
+        })
+        .await
+        .expect("expected player event before timeout")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stream_error_auto_pauses_and_resuming_reopens_the_output_device() {
+        let state = Arc::new(Mutex::new(FakeOutputState {
+            default_device: 1,
+            present_devices: vec![1],
+            opened_devices: Vec::new(),
+            error_channel: None,
+        }));
+        let (player, mut events) = spawn_with_backend(
+            tokio::runtime::Handle::current(),
+            Box::new(FakeOutputBackend {
+                state: state.clone(),
+            }),
+            Duration::from_secs(60),
+            Duration::ZERO,
+        );
+
+        player.send(PlayerCommand::PlayBytes {
+            generation: 21,
+            bytes: WAV_BODY.to_vec(),
+            unm_source: false,
+        });
+        recv_until(&mut events, Duration::from_secs(1), |event| {
+            matches!(event, PlayerEvent::Started { generation: 21, .. })
+        })
+        .await;
+        player.send(PlayerCommand::Play);
+        recv_until(&mut events, Duration::from_secs(1), |event| {
+            matches!(event, PlayerEvent::Position { generation: 21, .. })
+        })
+        .await;
+
+        let (token, err_tx, wake_tx) = state.lock().unwrap().error_channel.clone().unwrap();
+        err_tx.send(token).unwrap();
+        wake_tx.send(()).unwrap();
+        recv_until(&mut events, Duration::from_secs(1), |event| {
+            matches!(
+                event,
+                PlayerEvent::Paused {
+                    generation: 21,
+                    paused: true
+                }
+            )
+        })
+        .await;
+
+        {
+            let mut guard = state.lock().unwrap();
+            guard.default_device = 2;
+            guard.present_devices = vec![2];
+        }
+        player.send(PlayerCommand::TogglePause);
+        recv_until(&mut events, Duration::from_secs(1), |event| {
+            matches!(
+                event,
+                PlayerEvent::Paused {
+                    generation: 21,
+                    paused: false
+                }
+            )
+        })
+        .await;
+        recv_until(&mut events, Duration::from_secs(1), |event| {
+            matches!(event, PlayerEvent::Position { generation: 21, .. })
+        })
+        .await;
+
+        assert_eq!(state.lock().unwrap().opened_devices, vec![1, 2]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn manual_default_device_switch_hot_switches_without_pausing() {
+        let state = Arc::new(Mutex::new(FakeOutputState {
+            default_device: 1,
+            present_devices: vec![1, 2],
+            opened_devices: Vec::new(),
+            error_channel: None,
+        }));
+        let (player, mut events) = spawn_with_backend(
+            tokio::runtime::Handle::current(),
+            Box::new(FakeOutputBackend {
+                state: state.clone(),
+            }),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        );
+
+        player.send(PlayerCommand::PlayBytes {
+            generation: 22,
+            bytes: WAV_BODY.to_vec(),
+            unm_source: false,
+        });
+        recv_until(&mut events, Duration::from_secs(1), |event| {
+            matches!(event, PlayerEvent::Started { generation: 22, .. })
+        })
+        .await;
+        player.send(PlayerCommand::Play);
+        recv_until(&mut events, Duration::from_secs(1), |event| {
+            matches!(event, PlayerEvent::Position { generation: 22, .. })
+        })
+        .await;
+        while events.try_recv().is_ok() {}
+
+        state.lock().unwrap().default_device = 2;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while state.lock().unwrap().opened_devices != vec![1, 2] {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("default output switch should hot-switch the sink");
+
+        let mut saw_position = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(250);
+        while let Ok(Some(event)) = tokio::time::timeout_at(deadline, events.recv()).await {
+            assert!(
+                !matches!(event, PlayerEvent::Paused { .. }),
+                "manual device switch must not pause playback: {event:?}"
+            );
+            if matches!(event, PlayerEvent::Position { generation: 22, .. }) {
+                saw_position = true;
+            }
+        }
+        assert!(
+            saw_position,
+            "playback positions must continue after switch"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn default_device_change_when_previous_device_disappears_auto_pauses() {
+        let state = Arc::new(Mutex::new(FakeOutputState {
+            default_device: 1,
+            present_devices: vec![1, 2],
+            opened_devices: Vec::new(),
+            error_channel: None,
+        }));
+        let (player, mut events) = spawn_with_backend(
+            tokio::runtime::Handle::current(),
+            Box::new(FakeOutputBackend {
+                state: state.clone(),
+            }),
+            Duration::from_millis(20),
+            Duration::ZERO,
+        );
+
+        player.send(PlayerCommand::PlayBytes {
+            generation: 23,
+            bytes: WAV_BODY.to_vec(),
+            unm_source: false,
+        });
+        recv_until(&mut events, Duration::from_secs(1), |event| {
+            matches!(event, PlayerEvent::Started { generation: 23, .. })
+        })
+        .await;
+        player.send(PlayerCommand::Play);
+        recv_until(&mut events, Duration::from_secs(1), |event| {
+            matches!(event, PlayerEvent::Position { generation: 23, .. })
+        })
+        .await;
+
+        {
+            let mut guard = state.lock().unwrap();
+            guard.default_device = 2;
+            guard.present_devices = vec![2];
+        }
+        recv_until(&mut events, Duration::from_secs(1), |event| {
+            matches!(
+                event,
+                PlayerEvent::Paused {
+                    generation: 23,
+                    paused: true
+                }
+            )
+        })
+        .await;
+        assert_eq!(state.lock().unwrap().opened_devices, vec![1]);
+
+        player.send(PlayerCommand::TogglePause);
+        recv_until(&mut events, Duration::from_secs(1), |event| {
+            matches!(
+                event,
+                PlayerEvent::Paused {
+                    generation: 23,
+                    paused: false
+                }
+            )
+        })
+        .await;
+        assert_eq!(state.lock().unwrap().opened_devices, vec![1, 2]);
     }
 }
