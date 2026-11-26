@@ -222,7 +222,6 @@ impl AppState {
             self.view = View::Library;
         }
         self.session.login_qr = None;
-        self.selected = 0;
         self.filter.clear();
         self.sidebar_selected = 0;
         self.library_source = Source::Liked;
@@ -237,6 +236,7 @@ impl AppState {
             .load(stamp.uid, "liked")
             .map(|rows| rows.into_iter().map(|row| row.into_song_row()).collect())
             .unwrap_or_default();
+        self.selected = self.playing_selection_in(&self.library);
         self.liked = self.library.iter().map(|row| row.id).collect();
     }
 
@@ -264,7 +264,6 @@ impl AppState {
         self.library_source = source;
         self.sidebar_selected = index;
         self.sidebar_focus = false;
-        self.selected = 0;
         self.library_synced = false;
         self.library = self
             .session
@@ -273,6 +272,7 @@ impl AppState {
             .and_then(|(stamp, name)| fx.store.load(stamp.uid, name))
             .map(|rows| rows.into_iter().map(|row| row.into_song_row()).collect())
             .unwrap_or_default();
+        self.selected = self.playing_selection_in(&self.library);
         if let Some((stamp, session)) = self.personal_request(fx) {
             let request = self.begin_library_request();
             spawn_fetch_source(fx, stamp, request, session, source);
@@ -303,7 +303,9 @@ impl AppState {
                 self.status = Some(i18n::t_liked_songs_count(rows.len()));
             }
             self.library = rows;
-            self.selected = 0;
+            if self.view == View::Library && !self.filter.is_active() {
+                self.selected = self.playing_selection_in(&self.library);
+            }
             self.library_synced = true;
         }
     }

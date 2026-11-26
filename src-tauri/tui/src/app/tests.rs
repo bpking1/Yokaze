@@ -3428,3 +3428,102 @@ fn a_dead_cover_encoder_degrades_to_pixel_art_instead_of_ending_the_session() {
         .expect("a visible failure");
     assert!(feedback.contains("panicked"), "{feedback}");
 }
+
+#[tokio::test]
+async fn entering_queue_selects_the_currently_playing_track() {
+    let directory = tempfile::tempdir().unwrap();
+    let fx = effects(&directory);
+    let mut state = AppState::new(&Config::default());
+    state.queue = vec![row(10), row(20), row(30)];
+    state.queue_pos = Some(2);
+    state.current_track_id = Some(30);
+    state.selected = 0;
+
+    state.update(Action::SwitchView(View::Queue), &fx);
+    assert_eq!(state.selected, 2);
+
+    state.queue_pos = None;
+    state.current_track_id = Some(20);
+    state.update(Action::SwitchView(View::NowPlaying), &fx);
+    state.update(Action::SwitchView(View::Queue), &fx);
+    assert_eq!(state.selected, 1);
+
+    state.current_track_id = None;
+    state.update(Action::SwitchView(View::NowPlaying), &fx);
+    state.update(Action::SwitchView(View::Queue), &fx);
+    assert_eq!(state.selected, 0);
+}
+
+#[tokio::test]
+async fn entering_library_and_search_playlist_selects_the_currently_playing_track() {
+    let directory = tempfile::tempdir().unwrap();
+    let fx = effects(&directory);
+    let mut state = AppState::new(&Config::default());
+    let epoch = state.session.begin_restore();
+    state.update(
+        Action::SessionRestored {
+            epoch,
+            uid: 7,
+            nickname: "n".into(),
+        },
+        &fx,
+    );
+    let stamp = SessionStamp { epoch, uid: 7 };
+    state.library = vec![row(10), row(20), row(30)];
+    state.current_track_id = Some(30);
+    state.selected = 0;
+
+    state.update(Action::SwitchView(View::Library), &fx);
+    assert_eq!(state.selected, 2);
+
+    let request = state.library_request;
+    state.update(
+        Action::LibraryLoaded {
+            session: stamp,
+            request,
+            source: Source::Liked,
+            rows: vec![row(5), row(30), row(40)],
+        },
+        &fx,
+    );
+    assert_eq!(state.selected, 1);
+
+    // Background library sync must not clobber the selection while viewing Queue.
+    state.queue = vec![row(100), row(200), row(300)];
+    state.queue_pos = Some(2);
+    state.update(Action::SwitchView(View::Queue), &fx);
+    assert_eq!(state.selected, 2);
+    state.update(
+        Action::LibraryLoaded {
+            session: stamp,
+            request,
+            source: Source::Liked,
+            rows: vec![row(30), row(5)],
+        },
+        &fx,
+    );
+    assert_eq!(state.selected, 2);
+
+    // Entering a search playlist/album detail locates the playing track too.
+    state.update(Action::SwitchView(View::Search), &fx);
+    state.search.channel = crate::api::SearchChannel::Playlists;
+    state.search.playlists.items.push(crate::api::PlaylistHit {
+        privacy: 0,
+        id: 99,
+        name: "Mix".into(),
+        creator: "Listener".into(),
+        cover_url: None,
+        track_count: 3,
+    });
+    let detail = state.search.open_detail(0).unwrap();
+    state.update(
+        Action::SearchDetailLoaded {
+            seq: detail.seq,
+            channel: detail.channel,
+            id: detail.id,
+            rows: vec![row(1), row(2), row(30)],
+        },
+        &fx,
+    );
+    assert_eq!(state.selected, 2);
+}

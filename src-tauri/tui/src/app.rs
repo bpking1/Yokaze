@@ -1028,6 +1028,23 @@ impl AppState {
         self.selected = 0;
     }
 
+    pub(super) fn playing_selection_in(&self, rows: &[SongRow]) -> usize {
+        self.current_track_id
+            .and_then(|id| rows.iter().position(|row| row.id == id))
+            .unwrap_or(0)
+    }
+
+    pub(super) fn playing_selection_for_view(&self, view: View) -> usize {
+        match view {
+            View::Queue => self
+                .queue_pos
+                .filter(|index| *index < self.queue.len())
+                .unwrap_or_else(|| self.playing_selection_in(&self.queue)),
+            View::Library => self.playing_selection_in(&self.library),
+            _ => 0,
+        }
+    }
+
     fn reset_shuffle_order(&mut self) {
         self.shuffle_order.clear();
         self.shuffle_cursor = 0;

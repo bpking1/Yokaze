@@ -245,9 +245,15 @@ impl AppState {
                     }
                     self.view = view;
                 }
-                if view == View::Search {
-                    self.search.input = self.search.is_results();
-                    self.selected = self.search.page_selection();
+                match view {
+                    View::Search => {
+                        self.search.input = self.search.is_results();
+                        self.selected = self.search.page_selection();
+                    }
+                    View::Queue | View::Library => {
+                        self.selected = self.playing_selection_for_view(view);
+                    }
+                    _ => {}
                 }
             }
             Action::Back => self.navigate_back(fx),
@@ -592,7 +598,10 @@ impl AppState {
             } => {
                 let is_current = self.view == View::Search && !self.search.is_results();
                 if self.search.accept_detail(seq, channel, id, rows) && is_current {
-                    self.selected = 0;
+                    self.selected = self
+                        .search
+                        .song_rows()
+                        .map_or(0, |rows| self.playing_selection_in(rows));
                 }
             }
             Action::SearchDetailFailed {
